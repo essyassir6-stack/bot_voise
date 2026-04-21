@@ -2,7 +2,7 @@ const { Client, GatewayIntentBits, ChannelType, ActionRowBuilder, ButtonBuilder,
 require('dotenv').config();
 
 // ==================== VALIDATE ENVIRONMENT VARIABLES ====================
-const requiredEnvVars = ['DISCORD_TOKEN', 'LOBBY_CHANNEL_ID', 'CONTROL_PANEL_CHANNEL_ID'];
+const requiredEnvVars = ['DISCORD_TOKEN', 'LOBBY_CHANNEL_ID'];
 const missingEnvVars = requiredEnvVars.filter(envVar => !process.env[envVar]);
 
 if (missingEnvVars.length > 0) {
@@ -16,7 +16,6 @@ if (missingEnvVars.length > 0) {
 const CONFIG = {
     DISCORD_TOKEN: process.env.DISCORD_TOKEN,
     LOBBY_CHANNEL_ID: process.env.LOBBY_CHANNEL_ID,
-    CONTROL_PANEL_CHANNEL_ID: process.env.CONTROL_PANEL_CHANNEL_ID,
     BANNER_IMAGE_URL: process.env.BANNER_IMAGE_URL || 'https://media.discordapp.net/attachments/1480969774895730690/1496251251896352829/21906d71-f457-4fe4-af53-9f4353f00381.png'
 };
 
@@ -30,35 +29,20 @@ const client = new Client({
     ]
 });
 
-// Store active channels: userId -> { channelId, channelName, createdAt }
-const activeChannels = new Map();
+// Store active rooms: voiceChannelId -> { textChannelId, ownerId, ownerName }
+const activeRooms = new Map();
 
 // ==================== READY EVENT ====================
 client.once('ready', async () => {
     console.log(`✅ Bot is online!`);
     console.log(`📡 Logged in as: ${client.user.tag}`);
-    console.log(`🔧 Server: ${client.guilds.cache.size} guild(s)`);
     
-    // Verify channels exist
     const lobbyChannel = client.channels.cache.get(CONFIG.LOBBY_CHANNEL_ID);
-    const controlPanelChannel = client.channels.cache.get(CONFIG.CONTROL_PANEL_CHANNEL_ID);
-    
     if (!lobbyChannel) {
         console.error(`❌ LOBBY_CHANNEL_ID not found! Please check the ID: ${CONFIG.LOBBY_CHANNEL_ID}`);
     } else {
         console.log(`✅ Lobby channel: #${lobbyChannel.name}`);
-    }
-    
-    if (!controlPanelChannel) {
-        console.error(`❌ CONTROL_PANEL_CHANNEL_ID not found! Please check the ID: ${CONFIG.CONTROL_PANEL_CHANNEL_ID}`);
-    } else {
-        console.log(`✅ Control panel channel: #${controlPanelChannel.name}`);
-    }
-    
-    // Send control panel (only once, when bot starts)
-    if (controlPanelChannel) {
-        await sendControlPanel(controlPanelChannel);
-        console.log(`📋 Control panel sent!`);
+        console.log(`🎤 Users will get their own VC + text channel when they join`);
     }
 });
 
@@ -72,18 +56,17 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     // CASE 1: User joined the lobby channel
     if (newState.channelId === CONFIG.LOBBY_CHANNEL_ID && oldState.channelId !== CONFIG.LOBBY_CHANNEL_ID) {
         try {
-            // Delete any existing channel the user might have (cleanup)
-            if (activeChannels.has(user.id)) {
-                const oldChannel = guild.channels.cache.get(activeChannels.get(user.id).channelId);
-                if (oldChannel) await oldChannel.delete().catch(() => {});
-                activeChannels.delete(user.id);
-            }
+            console.log(`📢 ${user.username} joined lobby, creating rooms...`);
             
-            // Create temporary voice channel
-            const tempChannel = await guild.channels.create({
-                name: `${user.username}'s Room`,
+            // Get the lobby channel for category reference
+            const lobbyChannel = guild.channels.cache.get(CONFIG.LOBBY_CHANNEL_ID);
+            const categoryId = lobbyChannel.parentId;
+            
+            // 1. Create Voice Channel
+            const voiceChannel = await guild.channels.create({
+                name: `${user.username}'s VC`,
                 type: ChannelType.GuildVoice,
-                parent: newState.channel.parentId,
+                parent: categoryId,
                 userLimit: 0,
                 permissionOverwrites: [
                     {
@@ -103,66 +86,81 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
                 ]
             });
             
-            // Move user to new channel
-            await newState.member.voice.setChannel(tempChannel);
-            
-            // Store channel info
-            activeChannels.set(user.id, {
-                channelId: tempChannel.id,
-                channelName: tempChannel.name,
-                createdAt: Date.now()
+            // 2. Create Text Channel (linked)
+            const textChannel = await guild.channels.create({
+                name: `${user.username}-control`,
+                type: ChannelType.GuildText,
+                parent: categoryId,
+                permissionOverwrites: [
+                    {
+                        id: guild.id,
+                        deny: [PermissionsBitField.Flags.ViewChannel],
+                    },
+                    {
+                        id: user.id,
+                        allow: [
+                            PermissionsBitField.Flags.ViewChannel,
+                            PermissionsBitField.Flags.SendMessages,
+                            PermissionsBitField.Flags.ReadMessageHistory,
+                            PermissionsBitField.Flags.ManageMessages
+                        ],
+                    }
+                ]
             });
             
-            console.log(`✅ Created: ${tempChannel.name} for ${user.username}`);
+            // 3. Send Control Panel in the text channel
+            await sendControlPanel(textChannel, user, voiceChannel);
+            
+            // 4. Store room data
+            activeRooms.set(voiceChannel.id, {
+                textChannelId: textChannel.id,
+                ownerId: user.id,
+                ownerName: user.username,
+                voiceChannelName: voiceChannel.name
+            });
+            
+            // 5. Move user to their new voice channel
+            await newState.member.voice.setChannel(voiceChannel);
+            
+            console.log(`✅ Created: VC "${voiceChannel.name}" + Text "#${textChannel.name}" for ${user.username}`);
             
         } catch (error) {
-            console.error(`❌ Error creating channel for ${user.username}:`, error.message);
+            console.error(`❌ Error creating rooms for ${user.username}:`, error.message);
         }
     }
     
-    // CASE 2: User left their temporary channel
-    if (oldState.channelId && activeChannels.has(user.id)) {
-        const userChannel = activeChannels.get(user.id);
+    // CASE 2: User left their voice channel (cleanup)
+    if (oldState.channelId && activeRooms.has(oldState.channelId)) {
+        const roomData = activeRooms.get(oldState.channelId);
+        const voiceChannel = guild.channels.cache.get(oldState.channelId);
+        const textChannel = guild.channels.cache.get(roomData.textChannelId);
         
-        if (oldState.channelId === userChannel.channelId && !newState.channelId) {
+        // Check if voice channel is empty
+        if (voiceChannel && voiceChannel.members.size === 0) {
             try {
-                const channelToDelete = guild.channels.cache.get(userChannel.channelId);
-                if (channelToDelete) {
-                    await channelToDelete.delete();
-                    activeChannels.delete(user.id);
-                    console.log(`🗑️ Deleted: ${userChannel.channelName} (${user.username})`);
-                }
+                // Delete voice channel
+                if (voiceChannel) await voiceChannel.delete();
+                // Delete text channel
+                if (textChannel) await textChannel.delete();
+                // Remove from storage
+                activeRooms.delete(oldState.channelId);
+                
+                console.log(`🗑️ Deleted: VC + Text for ${roomData.ownerName}`);
             } catch (error) {
-                console.error(`❌ Error deleting channel:`, error.message);
+                console.error(`❌ Error deleting rooms:`, error.message);
             }
         }
     }
-    
-    // CASE 3: Auto-cleanup empty channels (runs every voice update)
-    setTimeout(async () => {
-        for (const [ownerId, channelData] of activeChannels) {
-            const tempChannel = guild.channels.cache.get(channelData.channelId);
-            if (tempChannel && tempChannel.members.size === 0) {
-                try {
-                    await tempChannel.delete();
-                    activeChannels.delete(ownerId);
-                    console.log(`🧹 Cleaned: ${channelData.channelName} (empty)`);
-                } catch (err) {
-                    // Channel already deleted
-                }
-            }
-        }
-    }, 5000); // Check after 5 seconds
 });
 
 // ==================== CONTROL PANEL ====================
-async function sendControlPanel(channel) {
+async function sendControlPanel(textChannel, owner, voiceChannel) {
     const embed = new EmbedBuilder()
-        .setTitle('🎮 Voice Channel Control Panel')
-        .setDescription('### Manage your temporary voice channel\nUse the buttons below to control your channel.\n\n> **Note:** Buttons only work for your own channel.')
+        .setTitle('🎮 Your Voice Channel Control Panel')
+        .setDescription(`Welcome **${owner.username}**!\n\nUse the buttons below to manage your voice channel **${voiceChannel.name}**.\n\n> 🔒 Lock - Prevent new people from joining\n> 👻 Hide - Make channel invisible\n> 📊 Limit - Set user limit\n> ✏️ Rename - Change channel name\n> 🚫 Ban - Kick someone from your channel\n> ✅ Permit - Allow someone to join\n> 👑 Claim - Take ownership if owner leaves\n> 🔄 Transfer - Give ownership to someone else`)
         .setColor('#5865F2')
         .setImage(CONFIG.BANNER_IMAGE_URL)
-        .setFooter({ text: 'Temporary Voice Bot • Made for Railway', iconURL: client.user.displayAvatarURL() })
+        .setFooter({ text: `Your private channel • Room created`, iconURL: owner.displayAvatarURL() })
         .setTimestamp();
     
     // Row 1: Lock / Unlock / Hide / Unhide
@@ -174,29 +172,38 @@ async function sendControlPanel(channel) {
             new ButtonBuilder().setCustomId('unhide').setLabel('Unhide').setStyle(ButtonStyle.Secondary).setEmoji('👀')
         );
     
-    // Row 2: Limit / Invite / Ban / Permit
+    // Row 2: Limit / Rename / Bitrate
     const row2 = new ActionRowBuilder()
         .addComponents(
             new ButtonBuilder().setCustomId('limit').setLabel('Limit').setStyle(ButtonStyle.Primary).setEmoji('📊'),
+            new ButtonBuilder().setCustomId('rename').setLabel('Rename').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
+            new ButtonBuilder().setCustomId('bitrate').setLabel('Bitrate').setStyle(ButtonStyle.Secondary).setEmoji('🎵')
+        );
+    
+    // Row 3: Invite / Ban / Permit
+    const row3 = new ActionRowBuilder()
+        .addComponents(
             new ButtonBuilder().setCustomId('invite').setLabel('Invite').setStyle(ButtonStyle.Success).setEmoji('📨'),
             new ButtonBuilder().setCustomId('ban').setLabel('Ban').setStyle(ButtonStyle.Danger).setEmoji('🚫'),
             new ButtonBuilder().setCustomId('permit').setLabel('Permit').setStyle(ButtonStyle.Success).setEmoji('✅')
         );
     
-    // Row 3: Rename / Bitrate / Claim / Transfer
-    const row3 = new ActionRowBuilder()
+    // Row 4: Claim / Transfer
+    const row4 = new ActionRowBuilder()
         .addComponents(
-            new ButtonBuilder().setCustomId('rename').setLabel('Rename').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
-            new ButtonBuilder().setCustomId('bitrate').setLabel('Bitrate').setStyle(ButtonStyle.Secondary).setEmoji('🎵'),
             new ButtonBuilder().setCustomId('claim').setLabel('Claim').setStyle(ButtonStyle.Success).setEmoji('👑'),
             new ButtonBuilder().setCustomId('transfer').setLabel('Transfer').setStyle(ButtonStyle.Primary).setEmoji('🔄')
         );
     
-    await channel.send({ embeds: [embed], components: [row1, row2, row3] });
+    await textChannel.send({ 
+        content: `🔊 **Control panel for ${voiceChannel.name}**`,
+        embeds: [embed], 
+        components: [row1, row2, row3, row4] 
+    });
 }
 
 // ==================== HELPER FUNCTIONS ====================
-async function getUsersVoiceChannel(interaction) {
+async function getUsersRoom(interaction) {
     const member = interaction.member;
     const voiceChannel = member.voice.channel;
     
@@ -208,44 +215,58 @@ async function getUsersVoiceChannel(interaction) {
         return null;
     }
     
-    const ownerData = activeChannels.get(member.user.id);
-    if (!ownerData || ownerData.channelId !== voiceChannel.id) {
+    const roomData = activeRooms.get(voiceChannel.id);
+    if (!roomData) {
         await interaction.reply({ 
-            content: '❌ You can only manage your own temporary voice channel!', 
+            content: '❌ This is not a temporary voice channel!', 
             ephemeral: true 
         });
         return null;
     }
     
-    return voiceChannel;
+    // Check if user is owner (or admin override)
+    const isOwner = roomData.ownerId === member.user.id;
+    const isAdmin = member.permissions.has(PermissionsBitField.Flags.Administrator);
+    
+    if (!isOwner && !isAdmin) {
+        await interaction.reply({ 
+            content: '❌ Only the channel owner can use these controls!', 
+            ephemeral: true 
+        });
+        return null;
+    }
+    
+    return { voiceChannel, roomData, isOwner };
 }
 
 // ==================== BUTTON HANDLERS ====================
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
     
-    const voiceChannel = await getUsersVoiceChannel(interaction);
-    if (!voiceChannel) return;
+    const result = await getUsersRoom(interaction);
+    if (!result) return;
+    
+    const { voiceChannel, roomData } = result;
     
     switch (interaction.customId) {
         case 'lock':
             await voiceChannel.permissionOverwrites.edit(voiceChannel.guild.id, { Connect: false });
-            await interaction.reply({ content: '🔒 **Channel locked!**', ephemeral: true });
+            await interaction.reply({ content: '🔒 **Channel locked!** Nobody new can join.', ephemeral: true });
             break;
             
         case 'unlock':
             await voiceChannel.permissionOverwrites.edit(voiceChannel.guild.id, { Connect: true });
-            await interaction.reply({ content: '🔓 **Channel unlocked!**', ephemeral: true });
+            await interaction.reply({ content: '🔓 **Channel unlocked!** Anyone can join.', ephemeral: true });
             break;
             
         case 'hide':
             await voiceChannel.permissionOverwrites.edit(voiceChannel.guild.id, { ViewChannel: false });
-            await interaction.reply({ content: '👻 **Channel hidden!**', ephemeral: true });
+            await interaction.reply({ content: '👻 **Channel hidden!** Only you can see it.', ephemeral: true });
             break;
             
         case 'unhide':
             await voiceChannel.permissionOverwrites.edit(voiceChannel.guild.id, { ViewChannel: true });
-            await interaction.reply({ content: '👀 **Channel unhidden!**', ephemeral: true });
+            await interaction.reply({ content: '👀 **Channel unhidden!** Everyone can see it.', ephemeral: true });
             break;
             
         case 'limit':
@@ -284,14 +305,35 @@ client.on('interactionCreate', async (interaction) => {
                 const newName = renameCollected.first().content.slice(0, 32);
                 await voiceChannel.setName(newName);
                 
-                const ownerData = activeChannels.get(interaction.user.id);
-                if (ownerData) {
-                    ownerData.channelName = newName;
-                    activeChannels.set(interaction.user.id, ownerData);
-                }
+                // Update stored name
+                roomData.voiceChannelName = newName;
+                activeRooms.set(voiceChannel.id, roomData);
                 
                 await interaction.followUp({ content: `✅ Renamed to **${newName}**`, ephemeral: true });
                 await renameCollected.first().delete().catch(() => {});
+            } else {
+                await interaction.followUp({ content: '⏰ Timeout!', ephemeral: true });
+            }
+            break;
+            
+        case 'bitrate':
+            await interaction.reply({ 
+                content: '🎵 **Set bitrate**\nSend a number between 8-384 kbps', 
+                ephemeral: true 
+            });
+            
+            const bitrateFilter = m => m.author.id === interaction.user.id;
+            const bitrateCollected = await interaction.channel.awaitMessages({ filter: bitrateFilter, max: 1, time: 30000, errors: ['time'] }).catch(() => null);
+            
+            if (bitrateCollected?.first()) {
+                const bitrate = parseInt(bitrateCollected.first().content);
+                if (!isNaN(bitrate) && bitrate >= 8 && bitrate <= 384) {
+                    await voiceChannel.setBitrate(bitrate * 1000);
+                    await interaction.followUp({ content: `✅ Bitrate set to **${bitrate} kbps**`, ephemeral: true });
+                    await bitrateCollected.first().delete().catch(() => {});
+                } else {
+                    await interaction.followUp({ content: '❌ Invalid! Use 8-384.', ephemeral: true });
+                }
             } else {
                 await interaction.followUp({ content: '⏰ Timeout!', ephemeral: true });
             }
@@ -334,7 +376,7 @@ client.on('interactionCreate', async (interaction) => {
                     await member.voice.disconnect();
                 }
                 
-                await interaction.followUp({ content: `✅ **${targetUser.username}** banned!`, ephemeral: true });
+                await interaction.followUp({ content: `✅ **${targetUser.username}** banned from your channel!`, ephemeral: true });
                 await banCollected.first().delete().catch(() => {});
             } else {
                 await interaction.followUp({ content: '⏰ Timeout!', ephemeral: true });
@@ -343,7 +385,7 @@ client.on('interactionCreate', async (interaction) => {
             
         case 'permit':
             await interaction.reply({ 
-                content: '✅ **Permit a user**\nMention the user to allow joining', 
+                content: '✅ **Permit a user**\nMention the user to allow joining (if channel is locked)', 
                 ephemeral: true 
             });
             
@@ -353,51 +395,29 @@ client.on('interactionCreate', async (interaction) => {
             if (permitCollected?.first()) {
                 const targetUser = permitCollected.first().mentions.users.first();
                 await voiceChannel.permissionOverwrites.edit(targetUser.id, { Connect: true });
-                await interaction.followUp({ content: `✅ **${targetUser.username}** permitted!`, ephemeral: true });
+                await interaction.followUp({ content: `✅ **${targetUser.username}** can now join!`, ephemeral: true });
                 await permitCollected.first().delete().catch(() => {});
             } else {
                 await interaction.followUp({ content: '⏰ Timeout!', ephemeral: true });
             }
             break;
             
-        case 'bitrate':
-            await interaction.reply({ 
-                content: '🎵 **Set bitrate**\nSend a number between 8-384 kbps', 
-                ephemeral: true 
-            });
-            
-            const bitrateFilter = m => m.author.id === interaction.user.id;
-            const bitrateCollected = await interaction.channel.awaitMessages({ filter: bitrateFilter, max: 1, time: 30000, errors: ['time'] }).catch(() => null);
-            
-            if (bitrateCollected?.first()) {
-                const bitrate = parseInt(bitrateCollected.first().content);
-                if (!isNaN(bitrate) && bitrate >= 8 && bitrate <= 384) {
-                    await voiceChannel.setBitrate(bitrate * 1000);
-                    await interaction.followUp({ content: `✅ Bitrate set to **${bitrate} kbps**`, ephemeral: true });
-                    await bitrateCollected.first().delete().catch(() => {});
-                } else {
-                    await interaction.followUp({ content: '❌ Invalid! Use 8-384.', ephemeral: true });
-                }
-            } else {
-                await interaction.followUp({ content: '⏰ Timeout!', ephemeral: true });
-            }
-            break;
-            
         case 'claim':
-            const currentOwnerId = Array.from(activeChannels.entries()).find(([_, data]) => data.channelId === voiceChannel.id)?.[0];
-            const currentOwner = voiceChannel.guild.members.cache.get(currentOwnerId);
+            // Check if owner is still in channel
+            const owner = voiceChannel.guild.members.cache.get(roomData.ownerId);
+            const isOwnerInChannel = owner && voiceChannel.members.has(roomData.ownerId);
             
-            if (currentOwner && voiceChannel.members.has(currentOwnerId)) {
-                await interaction.reply({ content: '❌ Owner is still in the channel!', ephemeral: true });
+            if (isOwnerInChannel) {
+                await interaction.reply({ content: '❌ The owner is still in the channel!', ephemeral: true });
             } else {
-                activeChannels.delete(currentOwnerId);
-                activeChannels.set(interaction.user.id, {
-                    channelId: voiceChannel.id,
-                    channelName: voiceChannel.name,
-                    createdAt: Date.now()
-                });
+                // Update ownership
+                const oldOwnerId = roomData.ownerId;
+                roomData.ownerId = interaction.user.id;
+                roomData.ownerName = interaction.user.username;
+                activeRooms.set(voiceChannel.id, roomData);
                 
-                await voiceChannel.permissionOverwrites.edit(currentOwnerId, { Connect: false });
+                // Update permissions
+                await voiceChannel.permissionOverwrites.edit(oldOwnerId, { Connect: false });
                 await voiceChannel.permissionOverwrites.edit(interaction.user.id, {
                     Connect: true,
                     ManageChannels: true,
@@ -412,7 +432,7 @@ client.on('interactionCreate', async (interaction) => {
             
         case 'transfer':
             await interaction.reply({ 
-                content: '🔄 **Transfer ownership**\nMention the user to transfer to', 
+                content: '🔄 **Transfer ownership**\nMention the user to transfer ownership to', 
                 ephemeral: true 
             });
             
@@ -424,15 +444,12 @@ client.on('interactionCreate', async (interaction) => {
                 const newOwnerMember = voiceChannel.guild.members.cache.get(newOwner.id);
                 
                 if (!newOwnerMember) {
-                    await interaction.followUp({ content: '❌ User not found!', ephemeral: true });
+                    await interaction.followUp({ content: '❌ User not found in this server!', ephemeral: true });
                 } else {
-                    const oldOwnerId = interaction.user.id;
-                    activeChannels.delete(oldOwnerId);
-                    activeChannels.set(newOwner.id, {
-                        channelId: voiceChannel.id,
-                        channelName: voiceChannel.name,
-                        createdAt: Date.now()
-                    });
+                    const oldOwnerId = roomData.ownerId;
+                    roomData.ownerId = newOwner.id;
+                    roomData.ownerName = newOwner.username;
+                    activeRooms.set(voiceChannel.id, roomData);
                     
                     await voiceChannel.permissionOverwrites.edit(oldOwnerId, { Connect: true, ManageChannels: false });
                     await voiceChannel.permissionOverwrites.edit(newOwner.id, {
@@ -443,7 +460,7 @@ client.on('interactionCreate', async (interaction) => {
                         MoveMembers: true
                     });
                     
-                    await interaction.followUp({ content: `✅ Transferred to **${newOwner.username}**`, ephemeral: true });
+                    await interaction.followUp({ content: `✅ Transferred ownership to **${newOwner.username}**`, ephemeral: true });
                     await transferCollected.first().delete().catch(() => {});
                 }
             } else {
