@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, PermissionsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, PermissionsBitField, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ComponentType } = require('discord.js');
 require('dotenv').config();
 
 // ==================== VALIDATE ENVIRONMENT VARIABLES ====================
@@ -25,12 +25,16 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildVoiceStates,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers
     ]
 });
 
-// Store active rooms: voiceChannelId -> { textChannelId, ownerId, ownerName }
+// Store active rooms: voiceChannelId -> { textChannelId, ownerId, ownerName, panelMessageId }
 const activeRooms = new Map();
+
+// Store temporary action context for user selection
+const pendingActions = new Map(); // userId -> { action, voiceChannelId, interaction }
 
 // ==================== READY EVENT ====================
 client.once('ready', async () => {
@@ -42,7 +46,7 @@ client.once('ready', async () => {
         console.error(`❌ LOBBY_CHANNEL_ID not found! Please check the ID: ${CONFIG.LOBBY_CHANNEL_ID}`);
     } else {
         console.log(`✅ Lobby channel: #${lobbyChannel.name}`);
-        console.log(`🎤 Users will get their own VC + text channel when they join`);
+        console.log(`🎤 Users will get their own VC + locked control panel`);
     }
 });
 
@@ -58,7 +62,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         try {
             console.log(`📢 ${user.username} joined lobby, creating rooms...`);
             
-            // Get the lobby channel for category reference
             const lobbyChannel = guild.channels.cache.get(CONFIG.LOBBY_CHANNEL_ID);
             const categoryId = lobbyChannel.parentId;
             
@@ -86,7 +89,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
                 ]
             });
             
-            // 2. Create Text Channel (linked)
+            // 2. Create LOCKED Text Channel (no typing allowed)
             const textChannel = await guild.channels.create({
                 name: `${user.username}-control`,
                 type: ChannelType.GuildText,
@@ -100,29 +103,43 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
                         id: user.id,
                         allow: [
                             PermissionsBitField.Flags.ViewChannel,
+                            PermissionsBitField.Flags.ReadMessageHistory
+                        ],
+                        deny: [
+                            PermissionsBitField.Flags.SendMessages,
+                            PermissionsBitField.Flags.CreateInstantInvite,
+                            PermissionsBitField.Flags.AddReactions
+                        ]
+                    },
+                    {
+                        id: client.user.id,
+                        allow: [
+                            PermissionsBitField.Flags.ViewChannel,
                             PermissionsBitField.Flags.SendMessages,
                             PermissionsBitField.Flags.ReadMessageHistory,
-                            PermissionsBitField.Flags.ManageMessages
-                        ],
+                            PermissionsBitField.Flags.ManageMessages,
+                            PermissionsBitField.Flags.ManageChannels
+                        ]
                     }
                 ]
             });
             
-            // 3. Send Control Panel in the text channel
-            await sendControlPanel(textChannel, user, voiceChannel);
+            // 3. Send Control Panel in the locked text channel
+            const panelMessage = await sendControlPanel(textChannel, user, voiceChannel);
             
             // 4. Store room data
             activeRooms.set(voiceChannel.id, {
                 textChannelId: textChannel.id,
                 ownerId: user.id,
                 ownerName: user.username,
-                voiceChannelName: voiceChannel.name
+                voiceChannelName: voiceChannel.name,
+                panelMessageId: panelMessage.id
             });
             
             // 5. Move user to their new voice channel
             await newState.member.voice.setChannel(voiceChannel);
             
-            console.log(`✅ Created: VC "${voiceChannel.name}" + Text "#${textChannel.name}" for ${user.username}`);
+            console.log(`✅ Created: VC "${voiceChannel.name}" + Locked Text "#${textChannel.name}" for ${user.username}`);
             
         } catch (error) {
             console.error(`❌ Error creating rooms for ${user.username}:`, error.message);
@@ -135,17 +152,14 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         const voiceChannel = guild.channels.cache.get(oldState.channelId);
         const textChannel = guild.channels.cache.get(roomData.textChannelId);
         
-        // Check if voice channel is empty
         if (voiceChannel && voiceChannel.members.size === 0) {
             try {
-                // Delete voice channel
                 if (voiceChannel) await voiceChannel.delete();
-                // Delete text channel
                 if (textChannel) await textChannel.delete();
-                // Remove from storage
                 activeRooms.delete(oldState.channelId);
+                pendingActions.delete(roomData.ownerId);
                 
-                console.log(`🗑️ Deleted: VC + Text for ${roomData.ownerName}`);
+                console.log(`🗑️ Deleted: VC + Locked Text for ${roomData.ownerName}`);
             } catch (error) {
                 console.error(`❌ Error deleting rooms:`, error.message);
             }
@@ -156,11 +170,16 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 // ==================== CONTROL PANEL ====================
 async function sendControlPanel(textChannel, owner, voiceChannel) {
     const embed = new EmbedBuilder()
-        .setTitle('🎮 Your Voice Channel Control Panel')
-        .setDescription(`Welcome **${owner.username}**!\n\nUse the buttons below to manage your voice channel **${voiceChannel.name}**.\n\n> 🔒 Lock - Prevent new people from joining\n> 👻 Hide - Make channel invisible\n> 📊 Limit - Set user limit\n> ✏️ Rename - Change channel name\n> 🚫 Ban - Kick someone from your channel\n> ✅ Permit - Allow someone to join\n> 👑 Claim - Take ownership if owner leaves\n> 🔄 Transfer - Give ownership to someone else`)
+        .setTitle('🎮 Voice Channel Control Panel')
+        .setDescription(`Welcome **${owner.username}**!\n\nUse the buttons below to manage **${voiceChannel.name}**.\n\n> **Note:** This channel is locked — only buttons work here.`)
         .setColor('#5865F2')
         .setImage(CONFIG.BANNER_IMAGE_URL)
-        .setFooter({ text: `Your private channel • Room created`, iconURL: owner.displayAvatarURL() })
+        .addFields(
+            { name: '👑 Owner', value: `${owner.username}`, inline: true },
+            { name: '📊 Users in VC', value: `${voiceChannel.members.size}`, inline: true },
+            { name: '🔒 Status', value: 'Unlocked', inline: true }
+        )
+        .setFooter({ text: `Click buttons to control your channel`, iconURL: owner.displayAvatarURL() })
         .setTimestamp();
     
     // Row 1: Lock / Unlock / Hide / Unhide
@@ -180,26 +199,87 @@ async function sendControlPanel(textChannel, owner, voiceChannel) {
             new ButtonBuilder().setCustomId('bitrate').setLabel('Bitrate').setStyle(ButtonStyle.Secondary).setEmoji('🎵')
         );
     
-    // Row 3: Invite / Ban / Permit
+    // Row 3: Kick / Move / Ban / Permit
     const row3 = new ActionRowBuilder()
         .addComponents(
-            new ButtonBuilder().setCustomId('invite').setLabel('Invite').setStyle(ButtonStyle.Success).setEmoji('📨'),
+            new ButtonBuilder().setCustomId('kick').setLabel('Kick').setStyle(ButtonStyle.Danger).setEmoji('👢'),
+            new ButtonBuilder().setCustomId('move').setLabel('Move').setStyle(ButtonStyle.Primary).setEmoji('🔄'),
             new ButtonBuilder().setCustomId('ban').setLabel('Ban').setStyle(ButtonStyle.Danger).setEmoji('🚫'),
             new ButtonBuilder().setCustomId('permit').setLabel('Permit').setStyle(ButtonStyle.Success).setEmoji('✅')
         );
     
-    // Row 4: Claim / Transfer
+    // Row 4: Invite / Claim / Transfer
     const row4 = new ActionRowBuilder()
         .addComponents(
+            new ButtonBuilder().setCustomId('invite').setLabel('Invite').setStyle(ButtonStyle.Success).setEmoji('📨'),
             new ButtonBuilder().setCustomId('claim').setLabel('Claim').setStyle(ButtonStyle.Success).setEmoji('👑'),
             new ButtonBuilder().setCustomId('transfer').setLabel('Transfer').setStyle(ButtonStyle.Primary).setEmoji('🔄')
         );
     
-    await textChannel.send({ 
+    const message = await textChannel.send({ 
         content: `🔊 **Control panel for ${voiceChannel.name}**`,
         embeds: [embed], 
         components: [row1, row2, row3, row4] 
     });
+    
+    return message;
+}
+
+async function updatePanelEmbed(interaction, voiceChannel, roomData) {
+    const embed = new EmbedBuilder()
+        .setTitle('🎮 Voice Channel Control Panel')
+        .setDescription(`Manage **${voiceChannel.name}** using the buttons below.`)
+        .setColor('#5865F2')
+        .setImage(CONFIG.BANNER_IMAGE_URL)
+        .addFields(
+            { name: '👑 Owner', value: `<@${roomData.ownerId}>`, inline: true },
+            { name: '📊 Users in VC', value: `${voiceChannel.members.size}`, inline: true },
+            { name: '👥 Users', value: voiceChannel.members.map(m => `• ${m.user.username}`).join('\n') || 'None', inline: false }
+        )
+        .setFooter({ text: `Channel locked • Only buttons work` })
+        .setTimestamp();
+    
+    const textChannel = interaction.channel;
+    const panelMessage = await textChannel.messages.fetch(roomData.panelMessageId).catch(() => null);
+    if (panelMessage) {
+        await panelMessage.edit({ embeds: [embed] });
+    }
+}
+
+// ==================== USER SELECTION MENU ====================
+async function showUserSelectionMenu(interaction, voiceChannel, action) {
+    const members = voiceChannel.members.filter(m => !m.user.bot);
+    
+    if (members.size === 0) {
+        await interaction.reply({ 
+            content: '❌ No users in your voice channel to perform this action!', 
+            ephemeral: true 
+        });
+        return null;
+    }
+    
+    const selectMenu = new StringSelectMenuBuilder()
+        .setCustomId(`user_select_${action}`)
+        .setPlaceholder(`Select a user to ${action}...`)
+        .addOptions(
+            members.map(member => 
+                new StringSelectMenuOptionBuilder()
+                    .setLabel(member.user.username)
+                    .setValue(member.id)
+                    .setDescription(`ID: ${member.id}`)
+                    .setEmoji('👤')
+            )
+        );
+    
+    const row = new ActionRowBuilder().addComponents(selectMenu);
+    
+    const reply = await interaction.reply({
+        content: `👥 **Select a user to ${action}** from ${voiceChannel.name}:`,
+        components: [row],
+        ephemeral: true
+    });
+    
+    return reply;
 }
 
 // ==================== HELPER FUNCTIONS ====================
@@ -224,7 +304,6 @@ async function getUsersRoom(interaction) {
         return null;
     }
     
-    // Check if user is owner (or admin override)
     const isOwner = roomData.ownerId === member.user.id;
     const isAdmin = member.permissions.has(PermissionsBitField.Flags.Administrator);
     
@@ -241,6 +320,73 @@ async function getUsersRoom(interaction) {
 
 // ==================== BUTTON HANDLERS ====================
 client.on('interactionCreate', async (interaction) => {
+    if (interaction.isStringSelectMenu()) {
+        // Handle user selection from menu
+        const match = interaction.customId.match(/user_select_(.+)/);
+        if (!match) return;
+        
+        const action = match[1];
+        const targetUserId = interaction.values[0];
+        const pendingData = pendingActions.get(interaction.user.id);
+        
+        if (!pendingData || pendingData.action !== action) {
+            await interaction.reply({ content: '❌ Session expired! Please click the button again.', ephemeral: true });
+            return;
+        }
+        
+        const { voiceChannelId } = pendingData;
+        const voiceChannel = interaction.guild.channels.cache.get(voiceChannelId);
+        
+        if (!voiceChannel) {
+            await interaction.reply({ content: '❌ Voice channel not found!', ephemeral: true });
+            pendingActions.delete(interaction.user.id);
+            return;
+        }
+        
+        const targetMember = voiceChannel.members.get(targetUserId);
+        if (!targetMember) {
+            await interaction.reply({ content: '❌ That user is no longer in your voice channel!', ephemeral: true });
+            pendingActions.delete(interaction.user.id);
+            return;
+        }
+        
+        const roomData = activeRooms.get(voiceChannel.id);
+        
+        // Perform the action
+        switch (action) {
+            case 'kick':
+                await targetMember.voice.disconnect();
+                await interaction.reply({ content: `✅ **${targetMember.user.username}** has been kicked from your channel!`, ephemeral: true });
+                break;
+                
+            case 'move':
+                // Move to lobby or specific channel
+                const lobbyChannel = interaction.guild.channels.cache.get(CONFIG.LOBBY_CHANNEL_ID);
+                await targetMember.voice.setChannel(lobbyChannel);
+                await interaction.reply({ content: `✅ **${targetMember.user.username}** has been moved to the lobby!`, ephemeral: true });
+                break;
+                
+            case 'ban':
+                await voiceChannel.permissionOverwrites.edit(targetUserId, { Connect: false });
+                if (targetMember.voice.channelId === voiceChannel.id) {
+                    await targetMember.voice.disconnect();
+                }
+                await interaction.reply({ content: `✅ **${targetMember.user.username}** has been banned from your channel!`, ephemeral: true });
+                break;
+                
+            case 'permit':
+                await voiceChannel.permissionOverwrites.edit(targetUserId, { Connect: true });
+                await interaction.reply({ content: `✅ **${targetMember.user.username}** can now join your channel!`, ephemeral: true });
+                break;
+        }
+        
+        // Update panel embed
+        await updatePanelEmbed(interaction, voiceChannel, roomData);
+        pendingActions.delete(interaction.user.id);
+        await interaction.message.delete().catch(() => {});
+        return;
+    }
+    
     if (!interaction.isButton()) return;
     
     const result = await getUsersRoom(interaction);
@@ -305,7 +451,6 @@ client.on('interactionCreate', async (interaction) => {
                 const newName = renameCollected.first().content.slice(0, 32);
                 await voiceChannel.setName(newName);
                 
-                // Update stored name
                 roomData.voiceChannelName = newName;
                 activeRooms.set(voiceChannel.id, roomData);
                 
@@ -339,6 +484,26 @@ client.on('interactionCreate', async (interaction) => {
             }
             break;
             
+        case 'kick':
+            pendingActions.set(interaction.user.id, { action: 'kick', voiceChannelId: voiceChannel.id, timestamp: Date.now() });
+            await showUserSelectionMenu(interaction, voiceChannel, 'kick');
+            break;
+            
+        case 'move':
+            pendingActions.set(interaction.user.id, { action: 'move', voiceChannelId: voiceChannel.id, timestamp: Date.now() });
+            await showUserSelectionMenu(interaction, voiceChannel, 'move');
+            break;
+            
+        case 'ban':
+            pendingActions.set(interaction.user.id, { action: 'ban', voiceChannelId: voiceChannel.id, timestamp: Date.now() });
+            await showUserSelectionMenu(interaction, voiceChannel, 'ban');
+            break;
+            
+        case 'permit':
+            pendingActions.set(interaction.user.id, { action: 'permit', voiceChannelId: voiceChannel.id, timestamp: Date.now() });
+            await showUserSelectionMenu(interaction, voiceChannel, 'permit');
+            break;
+            
         case 'invite':
             await interaction.reply({ 
                 content: '📨 **Invite a user**\nMention the user you want to invite', 
@@ -358,65 +523,18 @@ client.on('interactionCreate', async (interaction) => {
             }
             break;
             
-        case 'ban':
-            await interaction.reply({ 
-                content: '🚫 **Ban a user**\nMention the user to ban from your channel', 
-                ephemeral: true 
-            });
-            
-            const banFilter = m => m.author.id === interaction.user.id && m.mentions.users.size > 0;
-            const banCollected = await interaction.channel.awaitMessages({ filter: banFilter, max: 1, time: 30000, errors: ['time'] }).catch(() => null);
-            
-            if (banCollected?.first()) {
-                const targetUser = banCollected.first().mentions.users.first();
-                await voiceChannel.permissionOverwrites.edit(targetUser.id, { Connect: false });
-                
-                const member = voiceChannel.guild.members.cache.get(targetUser.id);
-                if (member && voiceChannel.members.has(targetUser.id)) {
-                    await member.voice.disconnect();
-                }
-                
-                await interaction.followUp({ content: `✅ **${targetUser.username}** banned from your channel!`, ephemeral: true });
-                await banCollected.first().delete().catch(() => {});
-            } else {
-                await interaction.followUp({ content: '⏰ Timeout!', ephemeral: true });
-            }
-            break;
-            
-        case 'permit':
-            await interaction.reply({ 
-                content: '✅ **Permit a user**\nMention the user to allow joining (if channel is locked)', 
-                ephemeral: true 
-            });
-            
-            const permitFilter = m => m.author.id === interaction.user.id && m.mentions.users.size > 0;
-            const permitCollected = await interaction.channel.awaitMessages({ filter: permitFilter, max: 1, time: 30000, errors: ['time'] }).catch(() => null);
-            
-            if (permitCollected?.first()) {
-                const targetUser = permitCollected.first().mentions.users.first();
-                await voiceChannel.permissionOverwrites.edit(targetUser.id, { Connect: true });
-                await interaction.followUp({ content: `✅ **${targetUser.username}** can now join!`, ephemeral: true });
-                await permitCollected.first().delete().catch(() => {});
-            } else {
-                await interaction.followUp({ content: '⏰ Timeout!', ephemeral: true });
-            }
-            break;
-            
         case 'claim':
-            // Check if owner is still in channel
             const owner = voiceChannel.guild.members.cache.get(roomData.ownerId);
             const isOwnerInChannel = owner && voiceChannel.members.has(roomData.ownerId);
             
             if (isOwnerInChannel) {
                 await interaction.reply({ content: '❌ The owner is still in the channel!', ephemeral: true });
             } else {
-                // Update ownership
                 const oldOwnerId = roomData.ownerId;
                 roomData.ownerId = interaction.user.id;
                 roomData.ownerName = interaction.user.username;
                 activeRooms.set(voiceChannel.id, roomData);
                 
-                // Update permissions
                 await voiceChannel.permissionOverwrites.edit(oldOwnerId, { Connect: false });
                 await voiceChannel.permissionOverwrites.edit(interaction.user.id, {
                     Connect: true,
@@ -467,11 +585,21 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.followUp({ content: '⏰ Timeout!', ephemeral: true });
             }
             break;
-            
-        default:
-            await interaction.reply({ content: `⚠️ Button coming soon!`, ephemeral: true });
     }
+    
+    // Update panel embed after any changes
+    await updatePanelEmbed(interaction, voiceChannel, roomData);
 });
+
+// Clean up expired pending actions every minute
+setInterval(() => {
+    const now = Date.now();
+    for (const [userId, data] of pendingActions) {
+        if (now - data.timestamp > 60000) { // 1 minute timeout
+            pendingActions.delete(userId);
+        }
+    }
+}, 60000);
 
 // ==================== ERROR HANDLING ====================
 process.on('unhandledRejection', (error) => {
