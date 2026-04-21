@@ -1,11 +1,10 @@
 {
   "name": "railway-temp-voice-bot",
-  "version": "1.0.0",
-  "description": "Temporary voice channel bot for Railway",
+  "version": "2.0.0",
+  "description": "Temp VC with linked text channel and auto panel",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "discord.js": "^14.14.1",
